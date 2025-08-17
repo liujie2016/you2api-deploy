@@ -1,7 +1,14 @@
 {
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/main.go",
+      "use": "@vercel/go"
+    }
+  ],
   "rewrites": [
     {
-      "source": "/v1/chat/completions",
+      "source": "/(.*)",
       "destination": "/api/main"
     }
   ]
