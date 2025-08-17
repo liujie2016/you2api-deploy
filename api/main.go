@@ -239,9 +239,11 @@ func handleNonStreamingResponse(w http.ResponseWriter, youReq *http.Request) {
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		log.Println("you.com raw response:", line) // 添加日志记录
 		if strings.HasPrefix(line, "event: youChatToken") {
 			scanner.Scan()
 			data := scanner.Text()
+			log.Println("you.com raw data:", data) // 添加日志记录
 			if !strings.HasPrefix(data, "data: ") {
 				continue
 			}
