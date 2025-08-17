@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
-	"github.com/cardigann/cardigann/pkg/scraper"
 )
 
 type YouChatResponse struct {
@@ -134,10 +135,16 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dsToken := strings.TrimPrefix(authHeader, "Bearer ")
+	_ = dsToken // Token for future use
 
 	var openAIReq OpenAIRequest
 	if err := json.NewDecoder(r.Body).Decode(&openAIReq); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if len(openAIReq.Messages) == 0 {
+		http.Error(w, "Messages array cannot be empty", http.StatusBadRequest)
 		return
 	}
 
@@ -160,7 +167,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	// Construct the original URL
 	originalURL := "https://you.com/api/streamingSearch"
-	q := http.Request{}.URL.Query()
+	q := url.Values{}
 	q.Add("q", lastMessage)
 	q.Add("page", "1")
 	q.Add("count", "10")
@@ -175,11 +182,148 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	q.Add("enable_agent_clarification_questions", "true")
 	q.Add("use_nested_youchat_updates", "true")
 	q.Add("chat", string(chatHistoryJSON))
-	
+
 	// Use a proxy to bypass Cloudflare
 	proxyURL := "https://proxy.cors.sh/" + originalURL + "?" + q.Encode()
 
-	youReq, _ := http.NewRequest("GET", proxyURL, nil)
+	youReq, err := http.NewRequest("GET", proxyURL, nil)
+	if err != nil {
+		http.Error(w, "Failed to create request", http.StatusInternalServerError)
+		return
+	}
 
 	youReq.Header = http.Header{
-		"x-cors-api-key":             {
+		"x-cors-api-key":     {"live_a48b9b66e68b4b0bb41a3df6de21e59b4a28cfc55b1343a0b0b0f5b5c2e8e8c7"},
+		"User-Agent":         {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+		"Accept":             {"text/event-stream"},
+		"Accept-Language":    {"en-US,en;q=0.9"},
+		"Accept-Encoding":    {"gzip, deflate, br"},
+		"Referer":            {"https://you.com/"},
+		"Origin":             {"https://you.com"},
+		"DNT":                {"1"},
+		"Connection":         {"keep-alive"},
+		"Sec-Fetch-Dest":     {"empty"},
+		"Sec-Fetch-Mode":     {"cors"},
+		"Sec-Fetch-Site":     {"same-origin"},
+		"sec-ch-ua":          {"\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\""},
+		"sec-ch-ua-mobile":   {"?0"},
+		"sec-ch-ua-platform": {"\"Windows\""},
+	}
+
+	client := &http.Client{
+		Timeout: 300 * time.Second,
+	}
+
+	resp, err := client.Do(youReq)
+	if err != nil {
+		log.Printf("Request error: %v", err)
+		http.Error(w, "Failed to send request to You.com API", http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	if openAIReq.Stream {
+		handleStreamResponse(w, resp, originalModel)
+	} else {
+		handleNonStreamResponse(w, resp, originalModel)
+	}
+}
+
+func handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	scanner := bufio.NewScanner(resp.Body)
+	responseID := "chatcmpl-" + strconv.FormatInt(time.Now().Unix(), 10)
+	created := time.Now().Unix()
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "data: ") {
+			data := strings.TrimPrefix(line, "data: ")
+			if data == "[DONE]" {
+				// Send final chunk
+				finalChunk := OpenAIStreamResponse{
+					ID:      responseID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []Choice{{
+						Delta:        Delta{Content: ""},
+						Index:        0,
+						FinishReason: "stop",
+					}},
+				}
+				if jsonData, err := json.Marshal(finalChunk); err == nil {
+					fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
+				}
+				fmt.Fprint(w, "data: [DONE]\n\n")
+				break
+			} else {
+				var youResp map[string]interface{}
+				if err := json.Unmarshal([]byte(data), &youResp); err == nil {
+					if youChatToken, exists := youResp["youChatToken"].(string); exists && youChatToken != "" {
+						chunk := OpenAIStreamResponse{
+							ID:      responseID,
+							Object:  "chat.completion.chunk",
+							Created: created,
+							Model:   model,
+							Choices: []Choice{{
+								Delta: Delta{Content: youChatToken},
+								Index: 0,
+							}},
+						}
+						if jsonData, err := json.Marshal(chunk); err == nil {
+							fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
+						}
+					}
+				}
+			}
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+}
+
+func handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, model string) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var fullResponse strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "data: ") {
+			data := strings.TrimPrefix(line, "data: ")
+			if data != "[DONE]" {
+				var youResp map[string]interface{}
+				if err := json.Unmarshal([]byte(data), &youResp); err == nil {
+					if youChatToken, exists := youResp["youChatToken"].(string); exists && youChatToken != "" {
+						fullResponse.WriteString(youChatToken)
+					}
+				}
+			}
+		}
+	}
+
+	openAIResp := OpenAIResponse{
+		ID:      "chatcmpl-" + strconv.FormatInt(time.Now().Unix(), 10),
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []OpenAIChoice{{
+			Message: Message{
+				Role:    "assistant",
+				Content: fullResponse.String(),
+			},
+			Index:        0,
+			FinishReason: "stop",
+		}},
+	}
+
+	if err := json.NewEncoder(w).Encode(openAIResp); err != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+	}
+}
