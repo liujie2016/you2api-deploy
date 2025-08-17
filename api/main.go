@@ -112,15 +112,15 @@ func reverseMapModelName(youModel string) string {
 var originalModel string
 
 func Handler(w http.ResponseWriter, r *http.Request) {
-	// 检查是否应该使用备用处理器
-	if os.Getenv("USE_FALLBACK") == "true" || os.Getenv("FALLBACK_MODE") == "true" {
-		FallbackHandler(w, r)
+	// Handle test endpoint first
+	if r.URL.Path == "/test" || r.URL.Path == "/test/" {
+		TestHandler(w, r)
 		return
 	}
 
-	// Handle test endpoint
-	if r.URL.Path == "/test" {
-		TestHandler(w, r)
+	// 检查是否应该使用备用处理器
+	if os.Getenv("USE_FALLBACK") == "true" || os.Getenv("FALLBACK_MODE") == "true" {
+		FallbackHandler(w, r)
 		return
 	}
 
@@ -144,22 +144,29 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	authHeader := r.Header.Get("Authorization")
 	if !strings.HasPrefix(authHeader, "Bearer ") {
+		log.Printf("Missing or invalid authorization header from IP: %s", r.RemoteAddr)
 		http.Error(w, "Missing or invalid authorization header", http.StatusUnauthorized)
 		return
 	}
 	dsToken := strings.TrimPrefix(authHeader, "Bearer ")
+	log.Printf("Request authenticated, token length: %d", len(dsToken))
 	_ = dsToken // Token for future use
 
 	var openAIReq OpenAIRequest
 	if err := json.NewDecoder(r.Body).Decode(&openAIReq); err != nil {
+		log.Printf("Failed to decode request body: %v", err)
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
 	if len(openAIReq.Messages) == 0 {
+		log.Printf("Empty messages array received")
 		http.Error(w, "Messages array cannot be empty", http.StatusBadRequest)
 		return
 	}
+
+	log.Printf("Processing request: model=%s, messages=%d, stream=%v",
+		openAIReq.Model, len(openAIReq.Messages), openAIReq.Stream)
 
 	originalModel = openAIReq.Model
 	lastMessage := openAIReq.Messages[len(openAIReq.Messages)-1].Content
@@ -237,27 +244,56 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("You.com response status: %d", resp.StatusCode)
 
+	// Read a small part of the response body for debugging
+	bodyPreview := make([]byte, 200)
+	n, _ := resp.Body.Read(bodyPreview)
+	log.Printf("Response body preview (first %d bytes): %s", n, string(bodyPreview[:n]))
+
+	// Reset body reader
+	resp.Body.Close()
+	resp, err = client.Do(youReq)
+	if err != nil {
+		log.Printf("Failed to re-request: %v", err)
+		http.Error(w, "Failed to re-request You.com API", http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
 	if resp.StatusCode != 200 {
-		log.Printf("You.com API returned non-200 status: %d", resp.StatusCode)
-		http.Error(w, "You.com API request failed", http.StatusBadGateway)
+		log.Printf("You.com API returned non-200 status: %d, trying fallback methods...", resp.StatusCode)
+		// Try fallback method instead of failing immediately
+		fallbackContent := tryMultipleMethods(lastMessage, originalModel)
+		if fallbackContent == "" {
+			fallbackContent = generateFallbackResponse(lastMessage)
+			log.Printf("Using generated fallback response")
+		} else {
+			log.Printf("Successfully got content from fallback method, length: %d", len(fallbackContent))
+		}
+
+		if openAIReq.Stream {
+			sendStreamResponse(w, fallbackContent, originalModel)
+		} else {
+			sendNormalResponse(w, fallbackContent, originalModel)
+		}
 		return
 	}
 
 	if openAIReq.Stream {
 		content := handleStreamResponse(w, resp, originalModel)
-		// 如果主方法失败，尝试备用方法
+		// If primary method returns empty content, try fallback
 		if content == "" {
-			log.Printf("Primary method failed, trying fallback...")
+			log.Printf("Primary stream method returned empty content, trying fallback...")
 			fallbackContent := tryMultipleMethods(lastMessage, originalModel)
-			if fallbackContent != "" {
-				sendStreamResponse(w, fallbackContent, originalModel)
+			if fallbackContent == "" {
+				fallbackContent = generateFallbackResponse(lastMessage)
 			}
+			sendStreamResponse(w, fallbackContent, originalModel)
 		}
 	} else {
 		content := handleNonStreamResponse(w, resp, originalModel)
-		// 如果主方法失败，尝试备用方法
+		// If primary method returns empty content, try fallback
 		if content == "" {
-			log.Printf("Primary method failed, trying fallback...")
+			log.Printf("Primary non-stream method returned empty content, trying fallback...")
 			fallbackContent := tryMultipleMethods(lastMessage, originalModel)
 			if fallbackContent == "" {
 				fallbackContent = generateFallbackResponse(lastMessage)
@@ -356,7 +392,10 @@ func handleStreamResponse(w http.ResponseWriter, resp *http.Response, model stri
 			flusher.Flush()
 		}
 	}
-	return totalContent.String()
+
+	result := totalContent.String()
+	log.Printf("handleStreamResponse returning content length: %d", len(result))
+	return result
 }
 
 func handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, model string) string {
@@ -387,6 +426,9 @@ func handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, model s
 					if isDebug {
 						log.Printf("Non-stream parsed: %+v", youResp)
 					}
+
+					// Log all available fields for debugging
+					log.Printf("Available fields in response: %v", getMapKeys(youResp))
 
 					// Try multiple possible field names for the content
 					var content string
@@ -446,11 +488,15 @@ func handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, model s
 		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
 		return ""
 	}
+
+	log.Printf("handleNonStreamResponse returning content length: %d", len(finalContent))
 	return finalContent
 }
 
 // TestHandler - 简化的测试处理程序，用于调试You.com API
 func TestHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("TestHandler called with path: %s, method: %s", r.URL.Path, r.Method)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
@@ -487,6 +533,13 @@ func TestHandler(w http.ResponseWriter, r *http.Request) {
 		"direct_api":   result1,
 		"cors_proxy":   result2,
 		"timestamp":    time.Now().Unix(),
+		"debug_info": map[string]interface{}{
+			"path":   r.URL.Path,
+			"method": r.Method,
+			"headers": map[string]string{
+				"content-type": r.Header.Get("Content-Type"),
+			},
+		},
 	}
 
 	json.NewEncoder(w).Encode(response)
@@ -587,9 +640,9 @@ func testWithCORSProxy(message string) map[string]interface{} {
 	}
 }
 
-func parseTestStreamResponse(body *http.Response) string {
+func parseTestStreamResponse(resp *http.Response) string {
 	var content strings.Builder
-	scanner := bufio.NewScanner(body.Body)
+	scanner := bufio.NewScanner(resp.Body)
 	lineCount := 0
 
 	for scanner.Scan() {
@@ -644,4 +697,25 @@ func truncateString(s string, length int) string {
 		return s
 	}
 	return s[:length] + "..."
+}
+
+// Helper function to get map keys for debugging
+func getMapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// Enhanced error logging
+func logError(context string, err error) {
+	if err != nil {
+		log.Printf("ERROR [%s]: %v", context, err)
+	}
+}
+
+// Enhanced info logging
+func logInfo(context string, message string, args ...interface{}) {
+	log.Printf("INFO [%s]: %s", context, fmt.Sprintf(message, args...))
 }
