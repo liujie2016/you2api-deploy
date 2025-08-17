@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ddg-community/go-ddg-api"
+	"github.com/cardigann/cardigann/pkg/scraper"
 )
 
 type YouChatResponse struct {
@@ -70,7 +70,7 @@ var modelMap = map[string]string{
 	"gpt-4o":             "gpt_4o",
 	"gpt-4o-mini":        "gpt_4o_mini",
 	"gpt-4-turbo":        "gpt_4_turbo",
-	"gpt-3.5-turbo":      "gpt_3.5",
+	"gpt-3.5-turbo":      "gpt_3_5",
 	"claude-3-opus":      "claude_3_opus",
 	"claude-3-sonnet":    "claude_3_sonnet",
 	"claude-3.5-sonnet":  "claude_3_5_sonnet",
