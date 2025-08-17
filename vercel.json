@@ -8,10 +8,6 @@
   ],
   "rewrites": [
     {
-      "source": "/test",
-      "destination": "/api/test.go"
-    },
-    {
       "source": "/(.*)",
       "destination": "/api/main.go"
     }
