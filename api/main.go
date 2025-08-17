@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
 	"github.com/cardigann/cardigann/pkg/scraper"
 )
 
@@ -159,9 +158,9 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	chatHistoryJSON, _ := json.Marshal(chatHistory)
 
-	youReq, _ := http.NewRequest("GET", "https://you.com/api/streamingSearch", nil)
-
-	q := youReq.URL.Query()
+	// Construct the original URL
+	originalURL := "https://you.com/api/streamingSearch"
+	q := http.Request{}.URL.Query()
 	q.Add("q", lastMessage)
 	q.Add("page", "1")
 	q.Add("count", "10")
@@ -176,11 +175,11 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	q.Add("enable_agent_clarification_questions", "true")
 	q.Add("use_nested_youchat_updates", "true")
 	q.Add("chat", string(chatHistoryJSON))
-	youReq.URL.RawQuery = q.Encode()
+	
+	// Use a proxy to bypass Cloudflare
+	proxyURL := "https://proxy.cors.sh/" + originalURL + "?" + q.Encode()
+
+	youReq, _ := http.NewRequest("GET", proxyURL, nil)
 
 	youReq.Header = http.Header{
-		"sec-ch-ua-platform":         {"Windows"},
-		"Cache-Control":              {"no-cache"},
-		"sec-ch-ua":                  {`"Not(A:Brand";v="99", "Microsoft Edge";v="133", "Chromium";v="133"`},
-		"sec-ch-ua-bitness":          {"64"},
-		"sec-ch-ua-model":            {"
+		"x-cors-api-key":             {
