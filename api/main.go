@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -111,6 +112,12 @@ func reverseMapModelName(youModel string) string {
 var originalModel string
 
 func Handler(w http.ResponseWriter, r *http.Request) {
+	// 检查是否应该使用备用处理器
+	if os.Getenv("USE_FALLBACK") == "true" || os.Getenv("FALLBACK_MODE") == "true" {
+		FallbackHandler(w, r)
+		return
+	}
+
 	if r.URL.Path != "/v1/chat/completions" {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
@@ -222,14 +229,40 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	log.Printf("You.com response status: %d", resp.StatusCode)
+
+	if resp.StatusCode != 200 {
+		log.Printf("You.com API returned non-200 status: %d", resp.StatusCode)
+		http.Error(w, "You.com API request failed", http.StatusBadGateway)
+		return
+	}
+
 	if openAIReq.Stream {
-		handleStreamResponse(w, resp, originalModel)
+		content := handleStreamResponse(w, resp, originalModel)
+		// 如果主方法失败，尝试备用方法
+		if content == "" {
+			log.Printf("Primary method failed, trying fallback...")
+			fallbackContent := tryMultipleMethods(lastMessage, originalModel)
+			if fallbackContent != "" {
+				sendStreamResponse(w, fallbackContent, originalModel)
+			}
+		}
 	} else {
-		handleNonStreamResponse(w, resp, originalModel)
+		content := handleNonStreamResponse(w, resp, originalModel)
+		// 如果主方法失败，尝试备用方法
+		if content == "" {
+			log.Printf("Primary method failed, trying fallback...")
+			fallbackContent := tryMultipleMethods(lastMessage, originalModel)
+			if fallbackContent == "" {
+				fallbackContent = generateFallbackResponse(lastMessage)
+			}
+			sendNormalResponse(w, fallbackContent, originalModel)
+		}
 	}
 }
 
-func handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string) {
+func handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string) string {
+	var totalContent strings.Builder
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -237,11 +270,20 @@ func handleStreamResponse(w http.ResponseWriter, resp *http.Response, model stri
 	scanner := bufio.NewScanner(resp.Body)
 	responseID := "chatcmpl-" + strconv.FormatInt(time.Now().Unix(), 10)
 	created := time.Now().Unix()
+	isDebug := os.Getenv("DEBUG") == "true"
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		if isDebug {
+			log.Printf("Raw line: %s", line)
+		}
+
 		if strings.HasPrefix(line, "data: ") {
 			data := strings.TrimPrefix(line, "data: ")
+			if isDebug {
+				log.Printf("Data content: %s", data)
+			}
+
 			if data == "[DONE]" {
 				// Send final chunk
 				finalChunk := OpenAIStreamResponse{
@@ -260,24 +302,47 @@ func handleStreamResponse(w http.ResponseWriter, resp *http.Response, model stri
 				}
 				fmt.Fprint(w, "data: [DONE]\n\n")
 				break
-			} else {
+			} else if data != "" && data != "{}" {
 				var youResp map[string]interface{}
 				if err := json.Unmarshal([]byte(data), &youResp); err == nil {
+					if isDebug {
+						log.Printf("Parsed response: %+v", youResp)
+					}
+
+					// Try multiple possible field names for the content
+					var content string
 					if youChatToken, exists := youResp["youChatToken"].(string); exists && youChatToken != "" {
+						content = youChatToken
+					} else if text, exists := youResp["text"].(string); exists && text != "" {
+						content = text
+					} else if message, exists := youResp["message"].(string); exists && message != "" {
+						content = message
+					} else if delta, exists := youResp["delta"].(map[string]interface{}); exists {
+						if deltaContent, exists := delta["content"].(string); exists && deltaContent != "" {
+							content = deltaContent
+						}
+					}
+
+					if content != "" {
+						totalContent.WriteString(content)
 						chunk := OpenAIStreamResponse{
 							ID:      responseID,
 							Object:  "chat.completion.chunk",
 							Created: created,
 							Model:   model,
 							Choices: []Choice{{
-								Delta: Delta{Content: youChatToken},
+								Delta: Delta{Content: content},
 								Index: 0,
 							}},
 						}
 						if jsonData, err := json.Marshal(chunk); err == nil {
 							fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
 						}
+					} else if isDebug {
+						log.Printf("No content found in response: %+v", youResp)
 					}
+				} else if isDebug {
+					log.Printf("Failed to parse JSON: %v, data: %s", err, data)
 				}
 			}
 		}
@@ -285,26 +350,74 @@ func handleStreamResponse(w http.ResponseWriter, resp *http.Response, model stri
 			flusher.Flush()
 		}
 	}
+	return totalContent.String()
 }
 
-func handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, model string) {
+func handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, model string) string {
 	w.Header().Set("Content-Type", "application/json")
 
 	var fullResponse strings.Builder
 	scanner := bufio.NewScanner(resp.Body)
+	isDebug := os.Getenv("DEBUG") == "true"
+	lineCount := 0
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		lineCount++
+
+		if isDebug {
+			log.Printf("Non-stream line %d: %s", lineCount, line)
+		}
+
 		if strings.HasPrefix(line, "data: ") {
 			data := strings.TrimPrefix(line, "data: ")
-			if data != "[DONE]" {
+			if isDebug {
+				log.Printf("Non-stream data: %s", data)
+			}
+
+			if data != "[DONE]" && data != "" && data != "{}" {
 				var youResp map[string]interface{}
 				if err := json.Unmarshal([]byte(data), &youResp); err == nil {
-					if youChatToken, exists := youResp["youChatToken"].(string); exists && youChatToken != "" {
-						fullResponse.WriteString(youChatToken)
+					if isDebug {
+						log.Printf("Non-stream parsed: %+v", youResp)
 					}
+
+					// Try multiple possible field names for the content
+					var content string
+					if youChatToken, exists := youResp["youChatToken"].(string); exists && youChatToken != "" {
+						content = youChatToken
+					} else if text, exists := youResp["text"].(string); exists && text != "" {
+						content = text
+					} else if message, exists := youResp["message"].(string); exists && message != "" {
+						content = message
+					} else if delta, exists := youResp["delta"].(map[string]interface{}); exists {
+						if deltaContent, exists := delta["content"].(string); exists && deltaContent != "" {
+							content = deltaContent
+						}
+					}
+
+					if content != "" {
+						fullResponse.WriteString(content)
+					} else if isDebug {
+						log.Printf("No content found in non-stream response: %+v", youResp)
+					}
+				} else if isDebug {
+					log.Printf("Failed to parse non-stream JSON: %v, data: %s", err, data)
 				}
 			}
+		}
+	}
+
+	finalContent := fullResponse.String()
+	if isDebug {
+		log.Printf("Final response content length: %d, content: %s", len(finalContent), finalContent)
+	}
+
+	// If no content was found, provide a fallback message
+	if finalContent == "" {
+		finalContent = "I apologize, but I couldn't process your request at this time. Please try again."
+		if isDebug {
+			log.Printf("Using fallback content")
 		}
 	}
 
@@ -316,7 +429,7 @@ func handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, model s
 		Choices: []OpenAIChoice{{
 			Message: Message{
 				Role:    "assistant",
-				Content: fullResponse.String(),
+				Content: finalContent,
 			},
 			Index:        0,
 			FinishReason: "stop",
@@ -325,5 +438,7 @@ func handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, model s
 
 	if err := json.NewEncoder(w).Encode(openAIResp); err != nil {
 		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		return ""
 	}
+	return finalContent
 }
